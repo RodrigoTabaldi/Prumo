@@ -1,5 +1,5 @@
 import unittest
-from backend.domain import cents, parse_file, reconcile
+from backend.domain import cents, parse_file, parse_upload, reconcile
 
 
 class DomainTests(unittest.TestCase):
@@ -17,6 +17,27 @@ class DomainTests(unittest.TestCase):
     def test_csv_column_order_and_encoding(self):
         rows = parse_file('valor;descrição;data\n-1.200,00;Serviço;01/10/2026'.encode('cp1252'), 'file.csv')
         self.assertEqual(rows[0], {'date': '2026-10-01', 'description': 'Serviço', 'amount': -120000})
+
+    def test_detects_source_from_headers_and_accepts_tsv(self):
+        bank, rows = parse_upload(b'data\thistorico\tvalor\tsaldo\n01/10/2026\tPix\t10,00\t10,00', 'arquivo.tsv')
+        self.assertEqual(bank, 'bank')
+        self.assertEqual(rows[0]['amount'], 1000)
+        internal, _ = parse_upload(b'data;descricao;valor;categoria\n01/10/2026;Pix;10,00;Vendas', 'arquivo.csv')
+        self.assertEqual(internal, 'internal')
+
+    def test_reads_xlsx_transactions(self):
+        from io import BytesIO
+        from openpyxl import Workbook
+
+        buffer = BytesIO()
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(['Data', 'Descrição', 'Valor', 'Categoria'])
+        sheet.append(['01/10/2026', 'Pix', 10.50, 'Vendas'])
+        workbook.save(buffer)
+        role, rows = parse_upload(buffer.getvalue(), 'controle.xlsx')
+        self.assertEqual(role, 'internal')
+        self.assertEqual(rows[0]['amount'], 1050)
 
     def test_ambiguity_remains_pending(self):
         bank = [{'date': '2026-10-01', 'description': 'Pix', 'amount': 10000}]

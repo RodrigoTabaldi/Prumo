@@ -1,0 +1,4 @@
+conciliacao/build/** linguist-generated=true
+conciliacao/dist/** linguist-generated=true
+**/__pycache__/** linguist-generated=true
+*.html linguist-detectable=false

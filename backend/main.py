@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from pydantic import BaseModel, Field
 
-from backend.domain import parse_file, reconcile
+from backend.domain import parse_upload, reconcile
 
 app = FastAPI(title='Prumo · Conciliação bancária')
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'], allow_methods=['GET', 'POST', 'PATCH'], allow_headers=['Content-Type'])
@@ -56,21 +56,32 @@ def get_session(session_id: str):
 
 
 @app.post('/api/sessions', status_code=201)
-async def create_session(title: str = Form(min_length=1, max_length=100), account: str = Form(min_length=1, max_length=100), bank: UploadFile = File(), internal: UploadFile = File()):
+async def create_session(title: str = Form(min_length=1, max_length=100), account: str = Form(min_length=1, max_length=100), files: list[UploadFile] = File(default=[]), bank: UploadFile | None = File(default=None), internal: UploadFile | None = File(default=None)):
     if not title.strip() or not account.strip():
         raise HTTPException(422, 'Informe o nome e a conta.')
+    uploads = files or [upload for upload in (bank, internal) if upload is not None]
+    if len(uploads) != 2:
+        raise HTTPException(422, 'Selecione exatamente dois arquivos: o extrato bancário e os lançamentos do sistema.')
     parsed = []
-    for upload in (bank, internal):
+    for upload in uploads:
         content = await upload.read(5 * 1024 * 1024 + 1)
         if len(content) > 5 * 1024 * 1024:
             raise HTTPException(413, 'Cada arquivo deve ter até 5 MB.')
         try:
-            parsed.append(parse_file(content, upload.filename or ''))
+            parsed.append((upload.filename or 'arquivo', *parse_upload(content, upload.filename or '')))
         except ValueError as exc:
             raise HTTPException(422, f'{upload.filename}: {exc}') from exc
         finally:
             await upload.close()
-    rows = reconcile(*parsed)
+    roles = [entry[1] for entry in parsed]
+    if roles.count('bank') == 1 and roles.count('internal') == 0:
+        roles[roles.index(None)] = 'internal'
+    elif roles.count('internal') == 1 and roles.count('bank') == 0:
+        roles[roles.index(None)] = 'bank'
+    if set(roles) != {'bank', 'internal'}:
+        raise HTTPException(422, 'Não consegui distinguir os arquivos. Use um extrato OFX ou CSV com coluna de saldo/banco e um controle com coluna de categoria, fornecedor ou centro de custo. Também é possível identificar pelo nome do arquivo (extrato/controle).')
+    by_role = {role: rows for (_, _, rows), role in zip(parsed, roles)}
+    rows = reconcile(by_role['bank'], by_role['internal'])
     for index, row in enumerate(rows):
         row['id'] = str(index)
     session_id = str(uuid4())
@@ -105,6 +116,44 @@ def export(session_id: str):
     session = load(session_id)
     book = Workbook()
     book.remove(book.active)
+    summary = book.create_sheet('Resumo')
+    rows = session['rows']
+    transactions = [transaction for row in rows for transaction in (row['bank'], row['internal']) if transaction]
+    dates = [transaction['date'] for transaction in transactions]
+    summary.append(['Relatório de conciliação'])
+    summary.append(['Conciliação', session['title']])
+    summary.append(['Conta', session['account']])
+    summary.append(['Criado em', session['created']])
+    summary.append(['Período', f'{min(dates)} a {max(dates)}' if dates else 'Sem transações'])
+    summary.append([])
+    summary.append(['Situação', 'Lançamentos', 'Total banco (R$)', 'Total interno (R$)', 'Diferença (R$)'])
+    for status, label in [('matched', 'Conciliados'), ('bank_only', 'Pendentes no banco'), ('internal_only', 'Pendentes no controle')]:
+        group = [row for row in rows if row['status'] == status]
+        bank_total = sum((row['bank'] or {}).get('amount', 0) for row in group)
+        internal_total = sum((row['internal'] or {}).get('amount', 0) for row in group)
+        summary.append([label, len(group), bank_total / 100, internal_total / 100, (bank_total - internal_total) / 100])
+    bank_total = sum((row['bank'] or {}).get('amount', 0) for row in rows)
+    internal_total = sum((row['internal'] or {}).get('amount', 0) for row in rows)
+    summary.append(['Total', len(rows), bank_total / 100, internal_total / 100, (bank_total - internal_total) / 100])
+    for cell in summary[1]:
+        cell.font = Font(color='FFFFFF', bold=True, size=14)
+        cell.fill = PatternFill('solid', fgColor='183E35')
+    for cell in summary[7]:
+        cell.font = Font(color='FFFFFF', bold=True)
+        cell.fill = PatternFill('solid', fgColor='183E35')
+    for row in summary.iter_rows(min_row=8, min_col=3, max_col=5):
+        for cell in row:
+            cell.number_format = '#,##0.00'
+    for row in summary.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str):
+                cell.data_type = 's'
+    summary.column_dimensions['A'].width = 30
+    summary.column_dimensions['B'].width = 22
+    for column in ('C', 'D', 'E'):
+        summary.column_dimensions[column].width = 24
+    summary.freeze_panes = 'A8'
+    summary.auto_filter.ref = 'A7:E10'
     for status, title in [('matched', 'Conciliados'), ('bank_only', 'Só no banco'), ('internal_only', 'Só no interno')]:
         sheet = book.create_sheet(title)
         sheet.append(['Data', 'Descrição banco', 'Descrição interna', 'Valor (R$)', 'Observação'])

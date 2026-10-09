@@ -35,47 +35,126 @@ def normalize(value: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', value.lower().strip()) if unicodedata.category(c) != 'Mn')
 
 
-def parse_file(content: bytes, filename: str) -> list[dict]:
+ALIASES = {
+    'data': 'date', 'date': 'date', 'dt': 'date', 'data lancamento': 'date', 'data movimento': 'date',
+    'data pagamento': 'date', 'data emissao': 'date', 'posting date': 'date', 'transaction date': 'date',
+    'descricao': 'description', 'descricao do lancamento': 'description', 'historico': 'description',
+    'historico do lancamento': 'description', 'description': 'description', 'memo': 'description',
+    'lancamento': 'description', 'detalhe': 'description', 'favorecido': 'description', 'beneficiario': 'description',
+    'estabelecimento': 'description', 'complemento': 'description',
+    'valor': 'amount', 'amount': 'amount', 'value': 'amount', 'valor lancamento': 'amount',
+    'valor total': 'amount', 'valor liquido': 'amount', 'transaction amount': 'amount',
+}
+BANK_HINTS = {'saldo', 'banco', 'agencia', 'conta corrente', 'codigo banco', 'numero documento'}
+INTERNAL_HINTS = {'centro de custo', 'conta contabil', 'categoria', 'fornecedor', 'cliente', 'plano de contas', 'sistema'}
+
+
+def _decode(content: bytes) -> str:
     try:
-        text = content.decode('utf-8-sig')
+        return content.decode('utf-8-sig')
     except UnicodeDecodeError:
-        text = content.decode('cp1252')
-    if filename.lower().endswith('.ofx'):
+        return content.decode('cp1252')
+
+
+def _records_to_rows(records: list[dict]) -> list[dict]:
+    if not records:
+        raise ValueError('O arquivo não contém lançamentos.')
+    headers = list(records[0].keys())
+    mapping = {str(key): ALIASES.get(normalize(str(key))) for key in headers}
+    mapped = [value for value in mapping.values() if value]
+    if not {'date', 'description', 'amount'}.issubset(set(mapped)):
+        raise ValueError('Colunas necessárias: data, descrição/histórico e valor.')
+    columns = {target: [key for key, value in mapping.items() if value == target] for target in ('date', 'description', 'amount')}
+    preferred = {'date': ('data', 'date', 'dt'), 'description': ('descricao', 'description', 'historico', 'memo', 'lancamento'), 'amount': ('valor', 'amount', 'value')}
+    for target, keys in columns.items():
+        keys.sort(key=lambda key: preferred[target].index(normalize(key)) if normalize(key) in preferred[target] else len(preferred[target]))
+    rows = []
+    for number, record in enumerate(records, 2):
+        try:
+            if None in record:
+                raise ValueError('Quantidade de colunas invalida.')
+            values = {target: record.get(keys[0]) for target, keys in columns.items()}
+            description = str(values['description'] or '').strip()
+            if not description or len(description) > 500:
+                raise ValueError('Descrição vazia ou maior que 500 caracteres.')
+            raw_date = values['date']
+            transaction_date = raw_date.strftime('%Y-%m-%d') if hasattr(raw_date, 'strftime') else date(str(raw_date))
+            rows.append({'date': transaction_date, 'description': description, 'amount': cents(str(values['amount']))})
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError(f'Linha {number}: {exc}') from exc
+    return rows
+
+
+def _csv_records(text: str) -> tuple[list[dict], list[str]]:
+    first_line = text.splitlines()[0] if text.splitlines() else ''
+    try:
+        dialect = csv.Sniffer().sniff(text[:8192], delimiters=';,\t|')
+    except csv.Error:
+        delimiter = max((';', ',', '\t', '|'), key=first_line.count)
+        if first_line.count(delimiter) == 0:
+            raise ValueError('Arquivo delimitado inválido. Verifique o cabeçalho e as colunas.')
+        dialect = csv.excel
+        dialect.delimiter = delimiter
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    if not reader.fieldnames:
+        raise ValueError('Arquivo sem cabeçalho.')
+    return list(reader), reader.fieldnames
+
+
+def _detect_role(filename: str, headers: list[str], is_ofx: bool = False) -> str | None:
+    if is_ofx:
+        return 'bank'
+    normalized = {normalize(str(header)) for header in headers}
+    bank_score = sum(hint in normalized for hint in BANK_HINTS)
+    internal_score = sum(hint in normalized for hint in INTERNAL_HINTS)
+    if bank_score != internal_score:
+        return 'bank' if bank_score > internal_score else 'internal'
+    name = normalize(filename)
+    bank_name = any(term in name for term in ('extrato', 'banco', 'bank'))
+    internal_name = any(term in name for term in ('interno', 'sistema', 'controle', 'erp'))
+    return ('bank' if bank_name else 'internal') if bank_name != internal_name else None
+
+
+def parse_upload(content: bytes, filename: str) -> tuple[str | None, list[dict]]:
+    extension = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    if extension in {'csv', 'tsv', 'txt'}:
+        records, headers = _csv_records(_decode(content))
+        rows = _records_to_rows(records)
+        role = _detect_role(filename, headers)
+    elif extension == 'ofx':
         from ofxparse import OfxParser
         try:
-            ofx = OfxParser.parse(io.StringIO(text))
+            ofx = OfxParser.parse(io.StringIO(_decode(content)))
             if len(ofx.accounts) != 1:
                 raise ValueError('Importe um OFX de uma única conta.')
             rows = [{'date': t.date.date().isoformat(), 'description': t.memo or t.payee or 'Sem descrição', 'amount': cents(str(t.amount))} for t in ofx.account.statement.transactions]
         except Exception as exc:
             raise ValueError('OFX inválido ou com múltiplas contas. Exporte uma única conta.') from exc
-    elif filename.lower().endswith('.csv'):
+        role = 'bank'
+    elif extension == 'xlsx':
+        from openpyxl import load_workbook
         try:
-            dialect = csv.Sniffer().sniff(text[:8192], delimiters=';,\t')
-        except csv.Error as exc:
-            raise ValueError('CSV inválido. Utilize o modelo disponível.') from exc
-        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-        aliases = {'data': 'date', 'date': 'date', 'descricao': 'description', 'historico': 'description', 'description': 'description', 'valor': 'amount', 'amount': 'amount'}
-        mapping = {key: aliases.get(normalize(key)) for key in (reader.fieldnames or [])}
-        if set(mapping.values()) - {None} != {'date', 'description', 'amount'} or len([v for v in mapping.values() if v]) != 3:
-            raise ValueError('Colunas necessárias: data, descricao e valor, sem duplicação.')
-        rows = []
-        for number, row in enumerate(reader, 2):
-            try:
-                if None in row:
-                    raise ValueError('Quantidade de colunas inválida.')
-                record = {target: row[key] for key, target in mapping.items() if target}
-                description = record['description'].strip()
-                if not description or len(description) > 500:
-                    raise ValueError('Descrição vazia ou maior que 500 caracteres.')
-                rows.append({'date': date(record['date']), 'description': description, 'amount': cents(record['amount'])})
-            except (ValueError, AttributeError, TypeError) as exc:
-                raise ValueError(f'Linha {number}: {exc}') from exc
+            workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            sheet = workbook.active
+            values = sheet.iter_rows(values_only=True)
+            headers = [str(value or '').strip() for value in next(values, ())]
+            records = [dict(zip(headers, row)) for row in values if any(value is not None for value in row)]
+            rows = _records_to_rows(records)
+            role = _detect_role(filename, headers)
+            workbook.close()
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError('Planilha XLSX inválida ou protegida por senha.') from exc
     else:
-        raise ValueError('Formato não suportado. Utilize CSV ou OFX.')
+        raise ValueError('Formato não suportado. Envie CSV, TSV, TXT delimitado, XLSX ou OFX.')
     if not rows or len(rows) > 10000:
         raise ValueError('O arquivo deve conter entre 1 e 10.000 transações.')
-    return rows
+    return role, rows
+
+
+def parse_file(content: bytes, filename: str) -> list[dict]:
+    return parse_upload(content, filename)[1]
 
 
 def reconcile(bank: list[dict], internal: list[dict]) -> list[dict]:

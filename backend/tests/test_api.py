@@ -33,7 +33,10 @@ class ApiTests(unittest.TestCase):
         exported = self.client.get(path + '/export')
         self.assertEqual(exported.status_code, 200)
         book = load_workbook(io.BytesIO(exported.content))
-        self.assertEqual(book.sheetnames, ['Conciliados', 'Só no banco', 'Só no interno'])
+        self.assertEqual(book.sheetnames, ['Resumo', 'Conciliados', 'Só no banco', 'Só no interno'])
+        self.assertEqual(book['Resumo']['A8'].value, 'Conciliados')
+        self.assertEqual(book['Resumo']['B8'].value, 1)
+        self.assertEqual(book['Resumo']['E11'].value, -0.1)
         self.assertEqual(book['Conciliados']['B2'].data_type, 's')
         self.assertEqual(book['Só no banco']['E2'].value, 'Conferir tarifa')
 
@@ -43,6 +46,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(self.client.get('/api/sessions').json(), [])
         self.assertEqual(self.client.get('/api/sessions/unknown').status_code, 404)
+
+    def test_imports_two_generic_files_in_either_order(self):
+        bank = 'data;descricao;valor;saldo\n01/10/2026;Pix;100,00;100,00'
+        internal = 'data;descricao;valor;categoria\n01/10/2026;Pix;100,00;Receita'
+        response = self.client.post('/api/sessions', data={'title': 'Teste', 'account': 'Conta teste'}, files=[('files', ('controle.csv', internal)), ('files', ('extrato.csv', bank))])
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()['rows'][0]['status'], 'matched')
 
 
 if __name__ == '__main__':
